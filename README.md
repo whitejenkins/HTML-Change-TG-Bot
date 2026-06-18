@@ -27,3 +27,8 @@
 /allow_non_setam on|off — allow URLs outside setam.net.ua
 ```
 
+## .env
+```text
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+```
