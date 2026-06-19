@@ -1,16 +1,26 @@
 # HTML Monitor Telegram Bot
 
-Bot for tracking web pages and sending notifications to Telegram.
+Bot for tracking one or more web pages and sending notifications to Telegram.
+
+Examples:
+
+```text
+/url 1 https://example.com
+/url 2 https://example2.com
+/delurl 1 https://example.com
+/delurl 2 https://example2.com
+```
 
 ## Telegram commands
 
 ```text
 /start — help
 /help — help
-/url <URL> — set monitor URL and reset baseline
-/show_url — show current URL
-/check_now — check now
-/screenshot — send screenshot of current page
+/url [N] <URL> — set monitor URL #N and reset its baseline
+/delurl [N] [URL] — delete monitor URL #N; optional URL must match
+/show_url — show monitored URLs
+/check_now — check all URLs now
+/screenshot [N] — send screenshot of page #N
 /status — show current config and state
 /config — same as /status
 /interval <seconds> — set check interval, min 60 seconds
