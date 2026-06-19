@@ -2,15 +2,6 @@
 
 Bot for tracking one or more web pages and sending notifications to Telegram.
 
-Examples:
-
-```text
-/url 1 https://example.com
-/url 2 https://example2.com
-/delurl 1 https://example.com
-/delurl 2 https://example2.com
-```
-
 ## Telegram commands
 
 ```text
@@ -37,6 +28,14 @@ Examples:
 /ignore_clear — clear ignore regex list and reset baseline
 /reset — reset hash/snapshot baseline
 /allow_non_setam on|off — allow URLs outside setam.net.ua
+```
+
+Examples:
+```text
+/url 1 https://example.com
+/url 2 https://example2.com
+/delurl 1 https://example.com
+/delurl 2 https://example2.com
 ```
 
 ## .env
