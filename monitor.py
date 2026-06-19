@@ -7,7 +7,8 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -28,6 +29,7 @@ USER_AGENT = os.getenv(
     "Mozilla/5.0 SETAM-html-monitor/1.0 (+https://example.local; contact: admin@example.local)",
 )
 TG_POLL_TIMEOUT = int(os.getenv("TG_POLL_TIMEOUT", "20"))
+UKRAINE_TZ = ZoneInfo("Europe/Kyiv")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "monitor_url": os.getenv("MONITOR_URL", "").strip().strip('"').strip("'"),
@@ -52,8 +54,8 @@ stop_event = threading.Event()
 last_update_id: Optional[int] = None
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def current_time() -> str:
+    return datetime.now(UKRAINE_TZ).strftime("%Y-%m-%d %H:%M:%S Europe/Kyiv")
 
 
 def safe_int(value: Any, fallback: int, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
@@ -388,7 +390,7 @@ def send_page_screenshot(chat_id: Optional[str] = None, reason: str = "manual", 
     screenshot_path: Optional[Path] = None
     try:
         screenshot_path = make_screenshot(url, config)
-        tg_send_photo(target_chat, screenshot_path, caption=f"📸 SETAM screenshot #{key}: {reason}\n{utc_now()}")
+        tg_send_photo(target_chat, screenshot_path, caption=f"📸 SETAM screenshot #{key}: {reason}\n{current_time()}")
     finally:
         if screenshot_path:
             try:
@@ -411,7 +413,7 @@ def format_change_message(
 
     parts = [
         f"🔔 SETAM page #{index} changed",
-        f"Time: {utc_now()}",
+        f"Time: {current_time()}",
         f"URL: {url}",
         "",
         f"Old hash: {old_hash[:12] if old_hash else 'none'}",
@@ -451,18 +453,18 @@ def check_page(index: Any, manual_chat_id: Optional[str] = None) -> str:
             state = get_state()
             pages = get_pages(state)
             pages.setdefault(key, {})["url"] = url
-            pages[key].update({"hash": new_hash, "lots": new_lots, "last_checked_at": utc_now()})
+            pages[key].update({"hash": new_hash, "lots": new_lots, "last_checked_at": current_time()})
             state["pages"] = pages
             if key == "1":
-                state.update({"hash": new_hash, "lots": new_lots, "last_checked_at": utc_now(), "url": url})
+                state.update({"hash": new_hash, "lots": new_lots, "last_checked_at": current_time(), "url": url})
             save_snapshot(normalized, key)
             save_state_unlocked(state)
-        msg = f"✅ SETAM monitor #{key} initialized\nTime: {utc_now()}\nURL: {url}\nHash: {new_hash[:12]}\nLots found: {len(new_lots)}"
+        msg = f"✅ SETAM monitor #{key} initialized\nTime: {current_time()}\nURL: {url}\nHash: {new_hash[:12]}\nLots found: {len(new_lots)}"
         if config.get("notify_on_first_run") or manual_chat_id:
             tg_send(str(manual_chat_id or config.get("notify_chat_id")), msg)
             if config.get("send_screenshot_on_first_run"):
                 send_page_screenshot(str(manual_chat_id or config.get("notify_chat_id")), "first run", key)
-        print(f"[{utc_now()}] page #{key} first snapshot saved: {new_hash[:12]}, lots={len(new_lots)}", flush=True)
+        print(f"[{current_time()}] page #{key} first snapshot saved: {new_hash[:12]}, lots={len(new_lots)}", flush=True)
         return msg
 
     if new_hash != old_hash:
@@ -478,36 +480,36 @@ def check_page(index: Any, manual_chat_id: Optional[str] = None) -> str:
             pages[key].update({
                 "hash": new_hash,
                 "lots": new_lots,
-                "last_checked_at": utc_now(),
-                "last_changed_at": utc_now(),
+                "last_checked_at": current_time(),
+                "last_changed_at": current_time(),
             })
             state["pages"] = pages
             if key == "1":
                 state.update({
                     "hash": new_hash,
                     "lots": new_lots,
-                    "last_checked_at": utc_now(),
-                    "last_changed_at": utc_now(),
+                    "last_checked_at": current_time(),
+                    "last_changed_at": current_time(),
                     "url": url,
                 })
             save_snapshot(normalized, key)
             save_state_unlocked(state)
-        print(f"[{utc_now()}] page #{key} changed: {old_hash[:12]} -> {new_hash[:12]}", flush=True)
+        print(f"[{current_time()}] page #{key} changed: {old_hash[:12]} -> {new_hash[:12]}", flush=True)
         return message
 
     with state_lock:
         state = get_state()
         pages = get_pages(state)
         pages.setdefault(key, {})["url"] = url
-        pages[key]["last_checked_at"] = utc_now()
+        pages[key]["last_checked_at"] = current_time()
         state["pages"] = pages
         if key == "1":
-            state["last_checked_at"] = utc_now()
+            state["last_checked_at"] = current_time()
         save_state_unlocked(state)
-    msg = f"✅ No change for page #{key}\nTime: {utc_now()}\nHash: {new_hash[:12]}\nLots: {len(new_lots)}\nURL: {url}"
+    msg = f"✅ No change for page #{key}\nTime: {current_time()}\nHash: {new_hash[:12]}\nLots: {len(new_lots)}\nURL: {url}"
     if manual_chat_id:
         tg_send(str(manual_chat_id), msg)
-    print(f"[{utc_now()}] page #{key} no change: {new_hash[:12]}, lots={len(new_lots)}", flush=True)
+    print(f"[{current_time()}] page #{key} no change: {new_hash[:12]}, lots={len(new_lots)}", flush=True)
     return msg
 
 
@@ -523,7 +525,7 @@ def check_once(manual_chat_id: Optional[str] = None) -> str:
         try:
             results.append(check_page(index, manual_chat_id=manual_chat_id))
         except Exception as exc:
-            error = f"⚠️ SETAM monitor #{index} error\nTime: {utc_now()}\nURL: {pages[index].get('url')}\nError: {exc}"
+            error = f"⚠️ SETAM monitor #{index} error\nTime: {current_time()}\nURL: {pages[index].get('url')}\nError: {exc}"
             print(error, file=sys.stderr, flush=True)
             if manual_chat_id:
                 tg_send(str(manual_chat_id), error)
@@ -817,7 +819,7 @@ def handle_command(chat_id: str, text: str) -> None:
 
 def telegram_poll_loop() -> None:
     global last_update_id
-    print(f"[{utc_now()}] Telegram command polling started", flush=True)
+    print(f"[{current_time()}] Telegram command polling started", flush=True)
     while not stop_event.is_set():
         try:
             payload = {"timeout": TG_POLL_TIMEOUT}
@@ -840,7 +842,7 @@ def telegram_poll_loop() -> None:
 
 
 def monitor_loop() -> None:
-    print(f"[{utc_now()}] SETAM monitor loop started", flush=True)
+    print(f"[{current_time()}] SETAM monitor loop started", flush=True)
     while not stop_event.is_set():
         state = get_state()
         config = state["config"]
@@ -850,7 +852,7 @@ def monitor_loop() -> None:
         if pages:
             check_once()
         else:
-            print(f"[{utc_now()}] URL not set. Use /url 1 <URL> in Telegram.", flush=True)
+            print(f"[{current_time()}] URL not set. Use /url 1 <URL> in Telegram.", flush=True)
 
         force_check_event.wait(timeout=interval)
         force_check_event.clear()
