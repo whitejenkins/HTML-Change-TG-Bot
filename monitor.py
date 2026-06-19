@@ -19,6 +19,7 @@ from playwright.sync_api import sync_playwright
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 STATE_FILE = DATA_DIR / "state.json"
 SNAPSHOT_FILE = DATA_DIR / "last_snapshot.txt"
+SNAPSHOT_DIR = DATA_DIR / "snapshots"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BOOTSTRAP_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -109,6 +110,7 @@ def get_state() -> Dict[str, Any]:
                 merged_config["notify_chat_id"] = BOOTSTRAP_CHAT_ID
 
         state["config"] = merged_config
+        ensure_pages_unlocked(state)
         save_state_unlocked(state)
         return state
 
@@ -123,27 +125,84 @@ def update_config(**updates: Any) -> Dict[str, Any]:
         return state
 
 
-def reset_baseline() -> None:
+def page_key(index: Any) -> str:
+    return str(safe_int(index, 1, 1, 999))
+
+
+def snapshot_file(index: Any) -> Path:
+    return SNAPSHOT_DIR / f"page_{page_key(index)}.txt"
+
+
+def get_pages(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    pages = state.get("pages")
+    if isinstance(pages, dict):
+        return {str(k): v for k, v in pages.items() if isinstance(v, dict)}
+    return {}
+
+
+def ensure_pages_unlocked(state: Dict[str, Any]) -> None:
+    config = state.get("config") or {}
+    pages = get_pages(state)
+    legacy_url = config.get("monitor_url") or state.get("url")
+    if legacy_url and not pages and "1" not in pages:
+        pages["1"] = {
+            "url": legacy_url,
+            "hash": state.get("hash", ""),
+            "lots": state.get("lots", []),
+            "last_checked_at": state.get("last_checked_at"),
+            "last_changed_at": state.get("last_changed_at"),
+        }
+        if SNAPSHOT_FILE.exists() and not snapshot_file("1").exists():
+            try:
+                SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+                snapshot_file("1").write_text(SNAPSHOT_FILE.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+            except Exception:
+                pass
+    state["pages"] = pages
+    if pages:
+        config["monitor_url"] = pages[sorted(pages, key=lambda x: safe_int(x, 0))[0]].get("url", "")
+    state["config"] = config
+
+
+def reset_baseline(index: Optional[Any] = None) -> None:
     with state_lock:
         state = get_state()
-        for key in ["hash", "lots", "last_checked_at", "last_changed_at"]:
-            state.pop(key, None)
+        pages = get_pages(state)
+        targets = [page_key(index)] if index is not None else list(pages.keys())
+        for key in targets:
+            if key in pages:
+                for field in ["hash", "lots", "last_checked_at", "last_changed_at"]:
+                    pages[key].pop(field, None)
+                try:
+                    snapshot_file(key).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        if index is None:
+            for key in ["hash", "lots", "last_checked_at", "last_changed_at"]:
+                state.pop(key, None)
+            try:
+                SNAPSHOT_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+        state["pages"] = pages
         save_state_unlocked(state)
-        try:
-            SNAPSHOT_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
-def save_snapshot(text: str) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    SNAPSHOT_FILE.write_text(text, encoding="utf-8")
+def save_snapshot(text: str, index: Any = "1") -> None:
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_file(index).write_text(text, encoding="utf-8")
+    if page_key(index) == "1":
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SNAPSHOT_FILE.write_text(text, encoding="utf-8")
 
 
-def load_snapshot() -> str:
-    if not SNAPSHOT_FILE.exists():
-        return ""
-    return SNAPSHOT_FILE.read_text(encoding="utf-8", errors="replace")
+def load_snapshot(index: Any = "1") -> str:
+    path = snapshot_file(index)
+    if path.exists():
+        return path.read_text(encoding="utf-8", errors="replace")
+    if page_key(index) == "1" and SNAPSHOT_FILE.exists():
+        return SNAPSHOT_FILE.read_text(encoding="utf-8", errors="replace")
+    return ""
 
 
 def validate_startup() -> None:
@@ -317,16 +376,19 @@ def tg_send_photo(chat_id: str, photo_path: Path, caption: str = "") -> None:
         )
 
 
-def send_page_screenshot(chat_id: Optional[str] = None, reason: str = "manual") -> None:
-    config = get_state()["config"]
-    url = config.get("monitor_url")
+def send_page_screenshot(chat_id: Optional[str] = None, reason: str = "manual", index: Any = "1") -> None:
+    key = page_key(index)
+    state = get_state()
+    config = state["config"]
+    page = get_pages(state).get(key)
+    url = page.get("url") if page else config.get("monitor_url")
     if not url:
-        raise RuntimeError("MONITOR_URL не задан. Используй /url <URL>")
+        raise RuntimeError(f"MONITOR_URL #{key} не задан. Используй /url {key} <URL>")
     target_chat = str(chat_id or config.get("notify_chat_id") or BOOTSTRAP_CHAT_ID)
     screenshot_path: Optional[Path] = None
     try:
         screenshot_path = make_screenshot(url, config)
-        tg_send_photo(target_chat, screenshot_path, caption=f"📸 SETAM screenshot: {reason}\n{utc_now()}")
+        tg_send_photo(target_chat, screenshot_path, caption=f"📸 SETAM screenshot #{key}: {reason}\n{utc_now()}")
     finally:
         if screenshot_path:
             try:
@@ -335,15 +397,22 @@ def send_page_screenshot(chat_id: Optional[str] = None, reason: str = "manual") 
                 print(f"Failed to remove temporary screenshot: {exc}", file=sys.stderr, flush=True)
 
 
-def format_change_message(old_hash: str, new_hash: str, old_lots: List[str], new_lots: List[str], diff: str) -> str:
-    config = get_state()["config"]
+def format_change_message(
+    index: str,
+    url: str,
+    old_hash: str,
+    new_hash: str,
+    old_lots: List[str],
+    new_lots: List[str],
+    diff: str,
+) -> str:
     added = sorted(set(new_lots) - set(old_lots))
     removed = sorted(set(old_lots) - set(new_lots))
 
     parts = [
-        "🔔 SETAM page changed",
+        f"🔔 SETAM page #{index} changed",
         f"Time: {utc_now()}",
-        f"URL: {config.get('monitor_url')}",
+        f"URL: {url}",
         "",
         f"Old hash: {old_hash[:12] if old_hash else 'none'}",
         f"New hash: {new_hash[:12]}",
@@ -358,16 +427,18 @@ def format_change_message(old_hash: str, new_hash: str, old_lots: List[str], new
     return "\n".join(parts)
 
 
-def check_once(manual_chat_id: Optional[str] = None) -> str:
+def check_page(index: Any, manual_chat_id: Optional[str] = None) -> str:
+    key = page_key(index)
     with state_lock:
         state = get_state()
         config = state.get("config") or {}
-        url = config.get("monitor_url")
-        if not url:
-            raise RuntimeError("URL не задан. Используй /url <URL>")
-        old_hash = state.get("hash", "")
-        old_lots = state.get("lots", [])
-        old_snapshot = load_snapshot()
+        page = get_pages(state).get(key)
+        if not page or not page.get("url"):
+            raise RuntimeError(f"URL #{key} не задан. Используй /url {key} <URL>")
+        url = page.get("url")
+        old_hash = page.get("hash", "")
+        old_lots = page.get("lots", [])
+        old_snapshot = load_snapshot(key)
 
     timeout = safe_int(config.get("request_timeout"), 30, 5, 180)
     html = fetch_html(url, timeout=timeout)
@@ -378,47 +449,88 @@ def check_once(manual_chat_id: Optional[str] = None) -> str:
     if first_run:
         with state_lock:
             state = get_state()
-            state.update({"hash": new_hash, "lots": new_lots, "last_checked_at": utc_now(), "url": url})
-            save_snapshot(normalized)
+            pages = get_pages(state)
+            pages.setdefault(key, {})["url"] = url
+            pages[key].update({"hash": new_hash, "lots": new_lots, "last_checked_at": utc_now()})
+            state["pages"] = pages
+            if key == "1":
+                state.update({"hash": new_hash, "lots": new_lots, "last_checked_at": utc_now(), "url": url})
+            save_snapshot(normalized, key)
             save_state_unlocked(state)
-        msg = f"✅ SETAM monitor initialized\nTime: {utc_now()}\nURL: {url}\nHash: {new_hash[:12]}\nLots found: {len(new_lots)}"
+        msg = f"✅ SETAM monitor #{key} initialized\nTime: {utc_now()}\nURL: {url}\nHash: {new_hash[:12]}\nLots found: {len(new_lots)}"
         if config.get("notify_on_first_run") or manual_chat_id:
             tg_send(str(manual_chat_id or config.get("notify_chat_id")), msg)
             if config.get("send_screenshot_on_first_run"):
-                send_page_screenshot(str(manual_chat_id or config.get("notify_chat_id")), "first run")
-        print(f"[{utc_now()}] first snapshot saved: {new_hash[:12]}, lots={len(new_lots)}", flush=True)
+                send_page_screenshot(str(manual_chat_id or config.get("notify_chat_id")), "first run", key)
+        print(f"[{utc_now()}] page #{key} first snapshot saved: {new_hash[:12]}, lots={len(new_lots)}", flush=True)
         return msg
 
     if new_hash != old_hash:
         diff = build_diff(old_snapshot, normalized)
-        message = format_change_message(old_hash, new_hash, old_lots, new_lots, diff)
+        message = format_change_message(key, url, old_hash, new_hash, old_lots, new_lots, diff)
         notify(message)
         if config.get("send_screenshot_on_change"):
-            send_page_screenshot(reason="page changed")
+            send_page_screenshot(reason=f"page #{key} changed", index=key)
         with state_lock:
             state = get_state()
-            state.update({
+            pages = get_pages(state)
+            pages.setdefault(key, {})["url"] = url
+            pages[key].update({
                 "hash": new_hash,
                 "lots": new_lots,
                 "last_checked_at": utc_now(),
                 "last_changed_at": utc_now(),
-                "url": url,
             })
-            save_snapshot(normalized)
+            state["pages"] = pages
+            if key == "1":
+                state.update({
+                    "hash": new_hash,
+                    "lots": new_lots,
+                    "last_checked_at": utc_now(),
+                    "last_changed_at": utc_now(),
+                    "url": url,
+                })
+            save_snapshot(normalized, key)
             save_state_unlocked(state)
-        print(f"[{utc_now()}] changed: {old_hash[:12]} -> {new_hash[:12]}", flush=True)
+        print(f"[{utc_now()}] page #{key} changed: {old_hash[:12]} -> {new_hash[:12]}", flush=True)
         return message
 
     with state_lock:
         state = get_state()
-        state["last_checked_at"] = utc_now()
+        pages = get_pages(state)
+        pages.setdefault(key, {})["url"] = url
+        pages[key]["last_checked_at"] = utc_now()
+        state["pages"] = pages
+        if key == "1":
+            state["last_checked_at"] = utc_now()
         save_state_unlocked(state)
-    msg = f"✅ No change\nTime: {utc_now()}\nHash: {new_hash[:12]}\nLots: {len(new_lots)}\nURL: {url}"
+    msg = f"✅ No change for page #{key}\nTime: {utc_now()}\nHash: {new_hash[:12]}\nLots: {len(new_lots)}\nURL: {url}"
     if manual_chat_id:
         tg_send(str(manual_chat_id), msg)
-    print(f"[{utc_now()}] no change: {new_hash[:12]}, lots={len(new_lots)}", flush=True)
+    print(f"[{utc_now()}] page #{key} no change: {new_hash[:12]}, lots={len(new_lots)}", flush=True)
     return msg
 
+
+def check_once(manual_chat_id: Optional[str] = None) -> str:
+    with state_lock:
+        pages = get_pages(get_state())
+        if not pages:
+            raise RuntimeError("URL не задан. Используй /url 1 <URL>")
+        indexes = sorted(pages, key=lambda x: safe_int(x, 0))
+
+    results = []
+    for index in indexes:
+        try:
+            results.append(check_page(index, manual_chat_id=manual_chat_id))
+        except Exception as exc:
+            error = f"⚠️ SETAM monitor #{index} error\nTime: {utc_now()}\nURL: {pages[index].get('url')}\nError: {exc}"
+            print(error, file=sys.stderr, flush=True)
+            if manual_chat_id:
+                tg_send(str(manual_chat_id), error)
+            else:
+                notify(error)
+            results.append(error)
+    return "\n\n".join(results)
 
 def is_admin(chat_id: str) -> bool:
     config = get_state()["config"]
@@ -436,12 +548,35 @@ def require_admin(chat_id: str) -> bool:
     return False
 
 
+
+def parse_indexed_url_arg(arg: str, default_index: str = "1") -> Tuple[str, str]:
+    parts = arg.split(maxsplit=1)
+    if len(parts) == 2 and parts[0].isdigit():
+        return page_key(parts[0]), parts[1].strip()
+    return page_key(default_index), arg.strip()
+
+
+def pages_text() -> str:
+    pages = get_pages(get_state())
+    if not pages:
+        return "URL list is empty"
+    lines = ["📄 Monitored URLs"]
+    for key in sorted(pages, key=lambda x: safe_int(x, 0)):
+        page = pages[key]
+        lines.append(
+            f"{key}. {page.get('url')}\n"
+            f"   hash: {(page.get('hash') or '')[:12] or 'none'}, "
+            f"lots: {len(page.get('lots', []))}, "
+            f"last checked: {page.get('last_checked_at', 'never')}"
+        )
+    return "\n".join(lines)
+
 def config_text() -> str:
     state = get_state()
     c = state["config"]
     return (
         "⚙️ Current config\n"
-        f"URL: {c.get('monitor_url') or 'not set'}\n"
+        f"URLs monitored: {len(get_pages(state))}\n"
         f"Notify chat: {c.get('notify_chat_id')}\n"
         f"Admin chats: {', '.join(map(str, c.get('admin_chat_ids', [])))}\n"
         f"Interval: {c.get('check_interval')} sec\n"
@@ -457,17 +592,19 @@ def config_text() -> str:
         f"Last checked: {state.get('last_checked_at', 'never')}\n"
         f"Last changed: {state.get('last_changed_at', 'never')}\n"
         f"Hash: {(state.get('hash') or '')[:12] or 'none'}\n"
-        f"Lots: {len(state.get('lots', []))}"
+        f"Lots: {len(state.get('lots', []))}\n\n"
+        f"{pages_text()}"
     )
 
 
 def help_text() -> str:
     return (
         "SETAM monitor commands:\n\n"
-        "/url <URL> — задать URL мониторинга и сбросить baseline\n"
-        "/show_url — показать текущий URL\n"
+        "/url [N] <URL> — задать URL мониторинга #N и сбросить baseline\n"
+        "/delurl [N] [URL] — удалить URL #N; если URL указан, он должен совпасть\n"
+        "/show_url — показать список URL\n"
         "/check_now — проверить сейчас\n"
-        "/screenshot — отправить скрин текущей страницы\n"
+        "/screenshot [N] — отправить скрин страницы #N\n"
         "/status или /config — показать конфиг и состояние\n"
         "/interval <seconds> — интервал проверки, минимум 60 сек\n"
         "/timeout <seconds> — request timeout, 5-180 сек\n"
@@ -504,19 +641,60 @@ def handle_command(chat_id: str, text: str) -> None:
     try:
         if command == "/url":
             if not arg:
-                tg_send(chat_id, "Использование: /url https://setam.net.ua/...")
+                tg_send(chat_id, "Использование: /url [N] https://setam.net.ua/...")
                 return
+            index, url = parse_indexed_url_arg(arg)
             c = get_state()["config"]
-            ok, reason = validate_url(arg, allow_non_setam=bool(c.get("allow_non_setam_urls")))
+            ok, reason = validate_url(url, allow_non_setam=bool(c.get("allow_non_setam_urls")))
             if not ok:
                 tg_send(chat_id, f"❌ URL rejected: {reason}")
                 return
-            update_config(monitor_url=arg)
-            reset_baseline()
-            tg_send(chat_id, f"✅ URL updated and baseline reset:\n{arg}\n\nЗапусти /check_now для создания нового baseline.")
+            with state_lock:
+                state = get_state()
+                pages = get_pages(state)
+                pages[index] = {"url": url}
+                state["pages"] = pages
+                if index == "1":
+                    state["url"] = url
+                    state["config"]["monitor_url"] = url
+                save_state_unlocked(state)
+            reset_baseline(index)
+            force_check_event.set()
+            tg_send(chat_id, f"✅ URL #{index} updated and baseline reset:\n{url}\n\nЗапусти /check_now для создания нового baseline.")
+
+        elif command == "/delurl":
+            if not arg:
+                tg_send(chat_id, "Использование: /delurl [N] [URL]")
+                return
+            parts = arg.split(maxsplit=1)
+            index = page_key(parts[0]) if parts and parts[0].isdigit() else "1"
+            expected_url = parts[1].strip() if len(parts) == 2 and parts[0].isdigit() else (arg.strip() if not parts[0].isdigit() else "")
+            with state_lock:
+                state = get_state()
+                pages = get_pages(state)
+                page = pages.get(index)
+                if not page:
+                    tg_send(chat_id, f"URL #{index} не найден")
+                    return
+                if expected_url and page.get("url") != expected_url:
+                    tg_send(chat_id, f"❌ URL #{index} не совпадает. Сейчас:\n{page.get('url')}")
+                    return
+                removed_url = page.get("url")
+                pages.pop(index, None)
+                state["pages"] = pages
+                if index == "1":
+                    for key in ["hash", "lots", "last_checked_at", "last_changed_at", "url"]:
+                        state.pop(key, None)
+                state["config"]["monitor_url"] = pages[sorted(pages, key=lambda x: safe_int(x, 0))[0]].get("url", "") if pages else ""
+                save_state_unlocked(state)
+                try:
+                    snapshot_file(index).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            tg_send(chat_id, f"✅ URL #{index} deleted:\n{removed_url}")
 
         elif command == "/show_url":
-            tg_send(chat_id, str(get_state()["config"].get("monitor_url") or "URL not set"))
+            tg_send(chat_id, pages_text())
 
         elif command == "/check_now":
             tg_send(chat_id, "🔎 Checking now...")
@@ -524,7 +702,7 @@ def handle_command(chat_id: str, text: str) -> None:
 
         elif command == "/screenshot":
             tg_send(chat_id, "📸 Making screenshot...")
-            threading.Thread(target=lambda: send_page_screenshot(chat_id=chat_id, reason="manual"), daemon=True).start()
+            threading.Thread(target=lambda: send_page_screenshot(chat_id=chat_id, reason="manual", index=arg or "1"), daemon=True).start()
 
         elif command in {"/status", "/config"}:
             tg_send(chat_id, config_text())
@@ -667,20 +845,12 @@ def monitor_loop() -> None:
         state = get_state()
         config = state["config"]
         interval = safe_int(config.get("check_interval"), 900, 60, 86400)
-        url = config.get("monitor_url")
+        pages = get_pages(state)
 
-        if url:
-            try:
-                check_once()
-            except Exception as exc:
-                error = f"⚠️ SETAM monitor error\nTime: {utc_now()}\nURL: {url}\nError: {exc}"
-                print(error, file=sys.stderr, flush=True)
-                try:
-                    notify(error)
-                except Exception as tg_exc:
-                    print(f"Telegram send failed: {tg_exc}", file=sys.stderr, flush=True)
+        if pages:
+            check_once()
         else:
-            print(f"[{utc_now()}] URL not set. Use /url <URL> in Telegram.", flush=True)
+            print(f"[{utc_now()}] URL not set. Use /url 1 <URL> in Telegram.", flush=True)
 
         force_check_event.wait(timeout=interval)
         force_check_event.clear()
