@@ -245,35 +245,46 @@ def extract_lot_numbers(text: str) -> List[str]:
 
 
 def normalize_html(html: str, ignore_patterns: List[str]) -> Tuple[str, List[str]]:
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
-
-    text = soup.get_text("\n", strip=True)
-
     volatile_patterns = [
-        r"_csrf[^\n]*",
-        r"csrf[^\n]*",
-        r"session[^\n]*",
-        r"Час\s+серверу:\s*[^\n]*",
+        r"_csrf[^\n<]*",
+        r"csrf[^\n<]*",
+        r"session[^\n<]*",
+        r"Час\s+серверу:\s*[^\n<]*",
     ]
     volatile_patterns.extend(ignore_patterns or [])
 
+    cleaned_html = html
     for pattern in volatile_patterns:
         try:
-            text = re.sub(pattern, "", text, flags=re.IGNORECASE | re.MULTILINE)
+            cleaned_html = re.sub(pattern, "", cleaned_html, flags=re.IGNORECASE | re.MULTILINE)
         except re.error:
             # Invalid user regex should not break monitoring.
             pass
 
-    lines = []
-    for line in text.splitlines():
+    soup = BeautifulSoup(cleaned_html, "lxml")
+    for tag in soup(["style", "noscript", "svg"]):
+        tag.decompose()
+
+    for tag in soup.find_all(True):
+        for attr in list(tag.attrs):
+            if attr.lower() in {"nonce", "integrity"} or attr.lower().startswith("data-react"):
+                del tag.attrs[attr]
+
+    text_lines = []
+    for line in soup.get_text("\n", strip=True).splitlines():
         line = re.sub(r"\s+", " ", line).strip()
         if line:
-            lines.append(line)
+            text_lines.append(line)
 
-    normalized = "\n".join(lines)
-    lots = extract_lot_numbers(normalized)
+    html_lines = []
+    for line in str(soup).splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            html_lines.append(line)
+
+    visible_text = "\n".join(text_lines)
+    normalized = "\n".join(["[visible-text]", visible_text, "", "[html]", "\n".join(html_lines)])
+    lots = extract_lot_numbers(visible_text)
     return normalized, lots
 
 
@@ -534,6 +545,7 @@ def check_once(manual_chat_id: Optional[str] = None) -> str:
             results.append(error)
     return "\n\n".join(results)
 
+
 def is_admin(chat_id: str) -> bool:
     config = get_state()["config"]
     admins = {str(x) for x in config.get("admin_chat_ids", []) if str(x)}
@@ -548,7 +560,6 @@ def require_admin(chat_id: str) -> bool:
     except Exception:
         pass
     return False
-
 
 
 def parse_indexed_url_arg(arg: str, default_index: str = "1") -> Tuple[str, str]:
@@ -572,6 +583,7 @@ def pages_text() -> str:
             f"last checked: {page.get('last_checked_at', 'never')}"
         )
     return "\n".join(lines)
+
 
 def config_text() -> str:
     state = get_state()
