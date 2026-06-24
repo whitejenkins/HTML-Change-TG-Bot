@@ -245,35 +245,46 @@ def extract_lot_numbers(text: str) -> List[str]:
 
 
 def normalize_html(html: str, ignore_patterns: List[str]) -> Tuple[str, List[str]]:
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
-
-    text = soup.get_text("\n", strip=True)
-
     volatile_patterns = [
-        r"_csrf[^\n]*",
-        r"csrf[^\n]*",
-        r"session[^\n]*",
-        r"Час\s+серверу:\s*[^\n]*",
+        r"_csrf[^\n<]*",
+        r"csrf[^\n<]*",
+        r"session[^\n<]*",
+        r"Час\s+серверу:\s*[^\n<]*",
     ]
     volatile_patterns.extend(ignore_patterns or [])
 
+    cleaned_html = html
     for pattern in volatile_patterns:
         try:
-            text = re.sub(pattern, "", text, flags=re.IGNORECASE | re.MULTILINE)
+            cleaned_html = re.sub(pattern, "", cleaned_html, flags=re.IGNORECASE | re.MULTILINE)
         except re.error:
             # Invalid user regex should not break monitoring.
             pass
 
-    lines = []
-    for line in text.splitlines():
+    soup = BeautifulSoup(cleaned_html, "lxml")
+    for tag in soup(["style", "noscript", "svg"]):
+        tag.decompose()
+
+    for tag in soup.find_all(True):
+        for attr in list(tag.attrs):
+            if attr.lower() in {"nonce", "integrity"} or attr.lower().startswith("data-react"):
+                del tag.attrs[attr]
+
+    text_lines = []
+    for line in soup.get_text("\n", strip=True).splitlines():
         line = re.sub(r"\s+", " ", line).strip()
         if line:
-            lines.append(line)
+            text_lines.append(line)
 
-    normalized = "\n".join(lines)
-    lots = extract_lot_numbers(normalized)
+    html_lines = []
+    for line in str(soup).splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            html_lines.append(line)
+
+    visible_text = "\n".join(text_lines)
+    normalized = "\n".join(["[visible-text]", visible_text, "", "[html]", "\n".join(html_lines)])
+    lots = extract_lot_numbers(visible_text)
     return normalized, lots
 
 
@@ -311,12 +322,13 @@ def tg_api(method: str, payload: Optional[dict] = None, timeout: int = 30, files
     return data
 
 
-def tg_send(chat_id: str, text: str) -> None:
+def tg_send(chat_id: str, text: str) -> Optional[dict]:
     max_len = 3900
     chunks = [text[i : i + max_len] for i in range(0, len(text), max_len)] or [text]
     timeout = get_state()["config"].get("request_timeout", 30)
+    last_response: Optional[dict] = None
     for chunk in chunks:
-        tg_api(
+        last_response = tg_api(
             "sendMessage",
             {
                 "chat_id": chat_id,
@@ -325,6 +337,21 @@ def tg_send(chat_id: str, text: str) -> None:
             },
             timeout=timeout,
         )
+    return last_response
+
+
+def tg_edit_message(chat_id: str, message_id: int, text: str) -> None:
+    timeout = get_state()["config"].get("request_timeout", 30)
+    tg_api(
+        "editMessageText",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text[:3900],
+            "disable_web_page_preview": True,
+        },
+        timeout=timeout,
+    )
 
 
 def notify(text: str) -> None:
@@ -513,7 +540,58 @@ def check_page(index: Any, manual_chat_id: Optional[str] = None) -> str:
     return msg
 
 
-def check_once(manual_chat_id: Optional[str] = None) -> str:
+def progress_bar(done: int, total: int, width: int = 10) -> str:
+    if total <= 0:
+        return "░" * width
+    filled = max(0, min(width, round(width * done / total)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def format_check_progress(indexes: List[str], current_index: Optional[str], done: int, status: str) -> str:
+    total = len(indexes)
+    lines = [
+        "🔎 Checking pages...",
+        f"Progress: [{progress_bar(done, total)}] {done}/{total}",
+        f"Status: {status}",
+    ]
+    if current_index:
+        lines.append(f"Current page: #{current_index}")
+    if indexes:
+        lines.append("Queue: " + ", ".join(f"#{index}" for index in indexes))
+    lines.append(f"Updated: {current_time()}")
+    return "\n".join(lines)
+
+
+def run_manual_check(chat_id: str, progress_message_id: Optional[int] = None) -> None:
+    try:
+        with state_lock:
+            indexes = sorted(get_pages(get_state()), key=lambda x: safe_int(x, 0))
+        if not indexes:
+            tg_send(chat_id, "URL не задан. Используй /url 1 <URL>")
+            return
+
+        def update_progress(current_index: Optional[str], done: int, status: str) -> None:
+            if progress_message_id is None:
+                return
+            try:
+                tg_edit_message(chat_id, progress_message_id, format_check_progress(indexes, current_index, done, status))
+            except Exception as exc:
+                print(f"Failed to update check progress: {exc}", file=sys.stderr, flush=True)
+
+        update_progress(None, 0, "starting")
+        check_once(manual_chat_id=chat_id, progress_callback=update_progress)
+        update_progress(None, len(indexes), "finished")
+    except Exception as exc:
+        if progress_message_id is not None:
+            try:
+                tg_edit_message(chat_id, progress_message_id, f"⚠️ Check failed: {exc}")
+                return
+            except Exception:
+                pass
+        tg_send(chat_id, f"⚠️ Check failed: {exc}")
+
+
+def check_once(manual_chat_id: Optional[str] = None, progress_callback: Optional[Any] = None) -> str:
     with state_lock:
         pages = get_pages(get_state())
         if not pages:
@@ -521,9 +599,13 @@ def check_once(manual_chat_id: Optional[str] = None) -> str:
         indexes = sorted(pages, key=lambda x: safe_int(x, 0))
 
     results = []
-    for index in indexes:
+    for position, index in enumerate(indexes, start=1):
+        if progress_callback:
+            progress_callback(index, position - 1, "checking")
         try:
             results.append(check_page(index, manual_chat_id=manual_chat_id))
+            if progress_callback:
+                progress_callback(index, position, "done")
         except Exception as exc:
             error = f"⚠️ SETAM monitor #{index} error\nTime: {current_time()}\nURL: {pages[index].get('url')}\nError: {exc}"
             print(error, file=sys.stderr, flush=True)
@@ -532,7 +614,10 @@ def check_once(manual_chat_id: Optional[str] = None) -> str:
             else:
                 notify(error)
             results.append(error)
+            if progress_callback:
+                progress_callback(index, position, "error")
     return "\n\n".join(results)
+
 
 def is_admin(chat_id: str) -> bool:
     config = get_state()["config"]
@@ -548,7 +633,6 @@ def require_admin(chat_id: str) -> bool:
     except Exception:
         pass
     return False
-
 
 
 def parse_indexed_url_arg(arg: str, default_index: str = "1") -> Tuple[str, str]:
@@ -572,6 +656,7 @@ def pages_text() -> str:
             f"last checked: {page.get('last_checked_at', 'never')}"
         )
     return "\n".join(lines)
+
 
 def config_text() -> str:
     state = get_state()
@@ -699,8 +784,10 @@ def handle_command(chat_id: str, text: str) -> None:
             tg_send(chat_id, pages_text())
 
         elif command == "/check_now":
-            tg_send(chat_id, "🔎 Checking now...")
-            threading.Thread(target=lambda: check_once(manual_chat_id=chat_id), daemon=True).start()
+            response = tg_send(chat_id, "🔎 Checking now...\nProgress: [░░░░░░░░░░] 0/?")
+            message = (response or {}).get("result") or {}
+            message_id = message.get("message_id")
+            threading.Thread(target=lambda: run_manual_check(chat_id, message_id), daemon=True).start()
 
         elif command == "/screenshot":
             tg_send(chat_id, "📸 Making screenshot...")
